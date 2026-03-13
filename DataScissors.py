@@ -4,6 +4,7 @@ import os
 import threading
 import hashlib
 import queue
+import re  # Yeni: regex için eklendi
 
 # ================== XP Stili ==================
 def set_xp_style():
@@ -24,8 +25,8 @@ def set_xp_style():
 class FileSplitterXP:
     def __init__(self, root, xp_font, xp_bold_font):
         self.root = root
-        self.root.title("DataScissors v1.0")
-        self.root.geometry("500x480")
+        self.root.title("DataScissors v1.1")  # Sürüm yükseltildi
+        self.root.geometry("500x520")  # Yeni elemanlar için biraz yükseklik arttı
         self.root.resizable(False, False)
 
         # Değişkenler
@@ -254,9 +255,18 @@ class FileSplitterXP:
         self.merged_name_entry.grid(row=4, column=0, columnspan=2, padx=5, sticky="ew")
         ttk.Button(tab, text="Gözat...", command=self.browse_merged_output).grid(row=4, column=2, padx=5)
 
-        # MD5 doğrulama seçeneği
+        # Hash doğrulama seçenekleri (geliştirilmiş)
+        verify_frame = ttk.Frame(tab)
+        verify_frame.grid(row=5, column=0, columnspan=3, sticky="w", pady=5)
         self.verify_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tab, text="Birleştirme sonrası MD5 doğrulaması yap", variable=self.verify_var).grid(row=5, column=0, columnspan=3, sticky="w", pady=5)
+        self.verify_cb = ttk.Checkbutton(verify_frame, text="Birleştirme sonrası hash doğrulaması yap", variable=self.verify_var)
+        self.verify_cb.pack(side=tk.LEFT)
+
+        # Hash algoritması seçimi
+        ttk.Label(verify_frame, text="Algoritma:").pack(side=tk.LEFT, padx=(10,2))
+        self.hash_algo = tk.StringVar(value="MD5")
+        self.hash_combo = ttk.Combobox(verify_frame, textvariable=self.hash_algo, values=["MD5", "SHA1", "SHA256"], state="readonly", width=8)
+        self.hash_combo.pack(side=tk.LEFT)
 
         # Butonlar
         btn_frame = ttk.Frame(tab)
@@ -281,10 +291,10 @@ class FileSplitterXP:
         # Otomatik çıktı adı oluştur (ilk parçanın adından yola çıkarak)
         if self.parts_listbox.size() > 0 and not self.merged_name_entry.get():
             first = self.parts_listbox.get(0)
-            # .partX uzantısını kaldır
-            base = first.replace(".part1", "").replace(".part2", "").replace(".part", "")
+            # .partX ifadesini temizle (regex ile)
+            base = re.sub(r'\.part\d+', '', first)  # Yeni: daha güvenli temizleme
             self.merged_name_entry.delete(0, tk.END)
-            self.merged_name_entry.insert(0, base + "_BIRLESTI" + os.path.splitext(base)[1])
+            self.merged_name_entry.insert(0, base)
 
     def clear_parts(self):
         self.parts_listbox.delete(0, tk.END)
@@ -313,50 +323,72 @@ class FileSplitterXP:
         self.merge_status.config(text="Birleştirme başlıyor...")
 
         self.merge_thread = threading.Thread(target=self._merge_worker,
-                                             args=(parts, output, self.verify_var.get()),
+                                             args=(parts, output, self.verify_var.get(), self.hash_algo.get()),
                                              daemon=True)
         self.merge_thread.start()
 
-    def _merge_worker(self, parts, output, verify):
+    def _merge_worker(self, parts, output, verify, hash_algo):
         try:
+            # 1. Parçaları sırala (dosya adındaki .partX'e göre)
+            def part_sort_key(filename):
+                match = re.search(r'\.part(\d+)', filename)
+                if match:
+                    return int(match.group(1))
+                return filename  # sayı bulunamazsa alfabetik sırala
+            parts_sorted = sorted(parts, key=part_sort_key)  # Yeni: sıralama eklendi
+
             total_size = 0
-            for p in parts:
+            for p in parts_sorted:
                 total_size += os.path.getsize(p)
+
+            # 2. Dinamik tampon boyutu belirle (dosya boyutuna göre)
+            if total_size > 1024 * 1024 * 1024:  # 1 GB'den büyük
+                buffer_size = 8 * 1024 * 1024
+            elif total_size > 100 * 1024 * 1024:  # 100 MB - 1 GB
+                buffer_size = 4 * 1024 * 1024
+            else:  # 100 MB'den küçük
+                buffer_size = 1024 * 1024  # 1 MB
 
             bytes_processed = 0
             with open(output, 'wb') as outfile:
-                for i, part in enumerate(parts):
+                for i, part in enumerate(parts_sorted):
                     if self.cancel_flag:
                         break
                     with open(part, 'rb') as infile:
                         while True:
-                            chunk = infile.read(1024*1024)
+                            chunk = infile.read(buffer_size)  # Dinamik buffer kullanımı
                             if not chunk:
                                 break
                             outfile.write(chunk)
                             bytes_processed += len(chunk)
                             progress = (bytes_processed / total_size) * 100
                             self.queue.put(('progress', progress))
-                            self.queue.put(('status', f"Parça {i+1}/{len(parts)} birleştiriliyor... %{progress:.1f}"))
+                            self.queue.put(('status', f"Parça {i+1}/{len(parts_sorted)} birleştiriliyor... %{progress:.1f}"))
                             if self.cancel_flag:
                                 break
 
             if self.cancel_flag:
                 self.queue.put(('status', "Birleştirme iptal edildi."))
-                # İptal edildiyse çıktı dosyasını sil
                 if os.path.exists(output):
                     os.remove(output)
             else:
                 if verify:
-                    self.queue.put(('status', "MD5 doğrulaması yapılıyor..."))
-                    # Orijinal dosyanın MD5'ini bulmak için: parçaların ilkinin adındaki .part1'i kaldırıp orijinali tahmin et
-                    # Ancak orijinal dosya mevcut olmayabilir. Burada basitçe birleştirilmiş dosyanın MD5'ini gösterelim.
-                    md5_hash = hashlib.md5()
+                    self.queue.put(('status', f"{hash_algo} doğrulaması yapılıyor..."))
+                    # Seçilen algoritma ile hash hesapla
+                    if hash_algo == "MD5":
+                        hash_obj = hashlib.md5()
+                    elif hash_algo == "SHA1":
+                        hash_obj = hashlib.sha1()
+                    elif hash_algo == "SHA256":
+                        hash_obj = hashlib.sha256()
+                    else:
+                        hash_obj = hashlib.md5()  # varsayılan
+
                     with open(output, 'rb') as f:
                         for chunk in iter(lambda: f.read(4096), b""):
-                            md5_hash.update(chunk)
-                    md5_digest = md5_hash.hexdigest()
-                    self.queue.put(('status', f"Birleştirme tamamlandı. MD5: {md5_digest}"))
+                            hash_obj.update(chunk)
+                    hash_digest = hash_obj.hexdigest()
+                    self.queue.put(('status', f"Birleştirme tamamlandı. {hash_algo}: {hash_digest}"))
                 else:
                     self.queue.put(('status', "Birleştirme tamamlandı."))
                 self.queue.put(('done', "Birleştirme başarıyla tamamlandı!", os.path.dirname(output)))
@@ -391,10 +423,9 @@ class FileSplitterXP:
                         self.merge_status.config(text=msg[1])
                 elif msg[0] == 'done':
                     messagebox.showinfo("Tamam", msg[1])
-                    # Klasörü aç
                     folder = msg[2]
-                    if os.path.exists(folder):
-                        os.startfile(folder) if os.name == 'nt' else None
+                    if os.path.exists(folder) and os.name == 'nt':
+                        os.startfile(folder)
                 elif msg[0] == 'error':
                     messagebox.showerror("Hata", msg[1])
                 elif msg[0] == 'split_finished':
